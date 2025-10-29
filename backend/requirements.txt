@@ -11,3 +11,5 @@ transformers
 Pillow
 torch
 # Or: pip install transformers pillow torch
+SQLAlchemy
+psycopg2-binary # PostgreSQL adapter for Python
