@@ -7,3 +7,7 @@ deepface
 opencv-python
 Pillow
 # DeepFace will handle its internal dependencies like TensorFlow/Keras
+transformers
+Pillow
+torch
+# Or: pip install transformers pillow torch
