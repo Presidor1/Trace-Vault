@@ -1,4 +1,5 @@
-# tracevault/backend/workers/orchestrator_worker.py
+      
+# tracevault/backend/workers/orchestrator_worker.py (UPDATED)
 
 import json
 import os
@@ -15,8 +16,11 @@ from workers.video_worker import process_video as video_processor
 from services.face_service import process_face_embedding as face_processor
 from services.scene_service import process_scene_analysis as scene_processor
 
-# Import the database models and session tool
-from database.models import init_db, Evidence, MetadataReport, Frame, AnalysisStatus, MediaType, FaceEmbedding, SceneAnalysis
+# NEW: Import the OSINT Scraper
+from osint.scrapers.twitter_searcher import search_twitter_by_face as twitter_osint_processor
+
+# Import the database models and session tool (including the new OSINTMatch)
+from database.models import init_db, Evidence, MetadataReport, Frame, AnalysisStatus, MediaType, FaceEmbedding, SceneAnalysis, OSINTMatch
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
 
@@ -33,7 +37,50 @@ if not DATABASE_URL:
 SessionLocal, engine = init_db(DATABASE_URL)
 
 
-# --- ORCHESTRATION LOGIC ---
+# --- NEW: OSINT SEARCH FUNCTION ---
+
+def run_osint_search(db: Session, face_record: FaceEmbedding, evidence_id: str):
+    """
+    Executes all required OSINT searches for a single FaceEmbedding record and persists results.
+    """
+    target_embedding = face_record.embedding_vector
+    
+    if not target_embedding:
+        logger.warning(f"Face ID {face_record.id} has no embedding vector. Skipping OSINT.")
+        return
+
+    # --- Step 1: Twitter OSINT Search ---
+    try:
+        twitter_result_str = twitter_osint_processor(target_embedding, evidence_id)
+        twitter_result = json.loads(twitter_result_str)
+        
+        matches_found = 0
+        for match_data in twitter_result.get("matches", []):
+            db_match = OSINTMatch(
+                face_embedding_id=face_record.id,
+                profile_name=match_data.get("profile_name"),
+                source_url=match_data.get("source_url"),
+                platform=match_data.get("platform"),
+                similarity_score=match_data.get("similarity_score"),
+                extended_data={
+                    "osint_id": match_data.get("osint_id"),
+                    "distance": match_data.get("distance")
+                }
+            )
+            db.add(db_match)
+            matches_found += 1
+
+        logger.info(f"-> OSINT Twitter search complete for Face ID {face_record.id}: {matches_found} matches recorded.")
+        
+    except Exception as e:
+        logger.error(f"Failed during Twitter OSINT search for Face ID {face_record.id}: {e}")
+    
+    # Add other OSINT searches (e.g., Facebook, Web Search) here later...
+    
+    db.commit()
+
+
+# --- ORCHESTRATION LOGIC (MODIFIED) ---
 
 def process_single_image_frame(
     db: Session, 
@@ -42,10 +89,8 @@ def process_single_image_frame(
     is_main_evidence: bool = False
 ):
     """
-    Handles the common analysis steps for a single image or video frame:
-    1. Face Embedding
-    2. Scene Analysis
-    3. Persistence to DB
+    Handles the common analysis steps for a single image or video frame.
+    MODIFIED: Now calls run_osint_search for each detected face.
     """
     
     # 1. Prepare Frame/Evidence Object in DB
@@ -67,6 +112,7 @@ def process_single_image_frame(
 
     logger.info(f"Processing frame/image: {image_path}")
 
+    detected_faces = []
     # --- Step 1: Face Analysis ---
     face_result_str = face_processor(image_path)
     face_result = json.loads(face_result_str)
@@ -79,10 +125,16 @@ def process_single_image_frame(
             attributes=face_data.get("attributes")
         )
         db.add(db_face)
+        # We must flush to get the ID *before* running OSINT
+        db.flush() 
+        detected_faces.append(db_face)
+        
+        # --- Step 3: Run OSINT Search Immediately after Embedding is Saved ---
+        run_osint_search(db, db_face, evidence_id)
     
-    logger.info(f"-> Face analysis complete: {len(face_result.get('faces', []))} faces recorded.")
+    logger.info(f"-> Face analysis and OSINT search complete: {len(detected_faces)} faces recorded.")
 
-    # --- Step 2: Scene Analysis ---
+    # --- Step 4: Scene Analysis ---
     scene_result_str = scene_processor(image_path)
     scene_result = json.loads(scene_result_str)
     
@@ -102,6 +154,7 @@ def process_single_image_frame(
 def orchestrate_analysis(evidence_id: str, original_path: str, media_type: MediaType):
     """
     The main orchestration function executed by the RQ worker.
+    The core logic remains the same, Phase 2 is now much more comprehensive.
     """
     logger.info(f"--- Starting orchestration for Evidence ID: {evidence_id} (Type: {media_type.value}) ---")
     
@@ -135,6 +188,7 @@ def orchestrate_analysis(evidence_id: str, original_path: str, media_type: Media
         
         # 1.2 Video Frame Extraction (if necessary)
         if media_type == MediaType.VIDEO:
+            # ... (Video Frame Extraction logic remains the same) ...
             video_result_str = video_processor(original_path)
             video_result = json.loads(video_result_str)
             
@@ -143,12 +197,10 @@ def orchestrate_analysis(evidence_id: str, original_path: str, media_type: Media
             
             # Persist Frame records first
             for frame_path in extracted_frames:
-                # NOTE: For simplicity, timestamp_sec is omitted here. 
-                # In production, the video worker should return the timestamp.
                 db_frame = Frame(
                     evidence_id=evidence_id,
                     frame_storage_path=frame_path,
-                    timestamp_sec=None # Could be calculated from filename (frame_0001.jpg)
+                    timestamp_sec=None
                 )
                 db.add(db_frame)
                 
@@ -156,11 +208,10 @@ def orchestrate_analysis(evidence_id: str, original_path: str, media_type: Media
             evidence.status = AnalysisStatus.FRAMES_EXTRACTED
             logger.info("Video frame paths persisted to database.")
 
-            # Update analysis targets to the extracted frames
             analysis_targets = extracted_frames
 
         
-        # --- PHASE 2: Frame/Image Analysis (Face & Scene) ---
+        # --- PHASE 2: Frame/Image Analysis (Face, OSINT, & Scene) ---
         
         for i, target_path in enumerate(analysis_targets):
             is_main = (i == 0 and media_type != MediaType.VIDEO)
@@ -184,4 +235,4 @@ def orchestrate_analysis(evidence_id: str, original_path: str, media_type: Media
 if __name__ == '__main__':
     # This block is for conceptual testing only. In reality, it runs via RQ.
     print("Orchestrator worker logic defined. Ready for RQ dispatch.")
-      
+    
