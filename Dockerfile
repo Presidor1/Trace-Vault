@@ -15,7 +15,7 @@ RUN npm run build
 
 # --- STAGE 2: Build the Python Backend and Final Image ---
 # Use a Python base image for the runtime environment
-FROM python:3.10-slim-buster AS backend_runtime
+FROM python:3.10-slim-bullseye AS backend_runtime
 
 # Set environment variables
 ENV PYTHONUNBUFFERED 1
