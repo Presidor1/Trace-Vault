@@ -3,3 +3,7 @@ Flask-CORS
 python-dotenv
 redis
 rq
+deepface
+opencv-python
+Pillow
+# DeepFace will handle its internal dependencies like TensorFlow/Keras
