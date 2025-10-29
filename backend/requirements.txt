@@ -13,3 +13,6 @@ torch
 # Or: pip install transformers pillow torch
 SQLAlchemy
 psycopg2-binary # PostgreSQL adapter for Python
+scipy       # For calculating cosine distance
+numpy       # For handling embedding vectors
+requests    # For external API calls (simulated here)
