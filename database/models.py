@@ -107,7 +107,7 @@ class Frame(Base):
     scene_analysis = relationship("SceneAnalysis", back_populates="frame", uselist=False, cascade="all, delete-orphan")
 
 
-# --- 4. Face Embedding Table ---
+# --- 4. Face Embedding Table (UPDATED: Added relationship to OSINTMatch) ---
 class FaceEmbedding(Base):
     """Stores the vector, bounding box, and attributes for a detected face."""
     __tablename__ = 'face_embeddings'
@@ -124,8 +124,10 @@ class FaceEmbedding(Base):
     # Attributes (age, gender, emotion, etc.)
     attributes = Column(JSON, nullable=True)
     
-    # Relationship
+    # Relationships
     frame = relationship("Frame", back_populates="faces")
+    # NEW: Link to all OSINT matches generated for this specific face
+    osint_matches = relationship("OSINTMatch", back_populates="face", cascade="all, delete-orphan")
 
 
 # --- 5. Scene Analysis Table ---
@@ -143,10 +145,36 @@ class SceneAnalysis(Base):
     frame = relationship("Frame", back_populates="scene_analysis")
 
 
+# --- 6. OSINT Match Table (NEW) ---
+class OSINTMatch(Base):
+    """Stores a record of a match between a detected face and an external OSINT profile."""
+    __tablename__ = 'osint_matches'
+    
+    id = Column(Integer, primary_key=True)
+    # The face this match is linked to
+    face_embedding_id = Column(Integer, ForeignKey('face_embeddings.id'), nullable=False)
+    
+    # Identity Information
+    profile_name = Column(String(255), nullable=False)
+    source_url = Column(Text, nullable=False)
+    platform = Column(String(50), nullable=False) # e.g., 'Twitter', 'Facebook', 'Public Web'
+    
+    # Match Scoring
+    similarity_score = Column(Float, nullable=False) # Higher is better (0 to 1)
+    
+    # Optional extended details extracted from the profile
+    extended_data = Column(JSON, nullable=True) 
+    
+    matched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    # Relationship back to the Face Embedding
+    face = relationship("FaceEmbedding", back_populates="osint_matches")
+
+
 # --- Test Block (Simple) ---
 if __name__ == '__main__':
     # This block allows local testing of the model definitions
     print("Database models defined successfully.")
     print(f"Total tables defined: {len(Base.metadata.tables)}")
     print("To test creation, run init_db() with a valid connection string.")
-  
+    
