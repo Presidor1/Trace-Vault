@@ -1,0 +1,12 @@
+/* tracevault/frontend/src/styles/globals.css */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Apply the dark background defined in tailwind.config.js to the entire body */
+body {
+  background-color: theme('colors.primary-dark');
+  color: white;
+  min-height: 100vh; /* Ensure the body covers the full viewport height */
+}
