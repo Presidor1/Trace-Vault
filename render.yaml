@@ -1,0 +1,70 @@
+# tracevault/render.yaml
+
+# This file defines the entire Render infrastructure for TraceVault:
+# 1. PostgreSQL Database
+# 2. TraceVault API/Web Service (Flask/Next.js)
+# 3. TraceVault Worker Service (RQ)
+
+databases:
+  - name: tracevault-db
+    plan: starter # Use 'starter' for testing, scale up as needed
+
+services:
+  # --- 1. Worker Service (Handles heavy analysis jobs via RQ) ---
+  - type: worker
+    name: tracevault-worker
+    env: python
+    region: oregon # Use a region close to your database
+    buildCommand: "pip install -r backend/requirements.txt"
+    # The start command runs the RQ worker listener
+    startCommand: "rq worker default -u ${REDIS_URL}"
+    # Scale up the instance type based on the complexity of your models (FaceNet, CLIP, etc.)
+    plan: standard 
+    
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12 # Specify Python version
+      - key: REDIS_URL # Must be set to your external Redis URL (e.g., Upstash)
+        sync: false
+      - key: DATABASE_URL 
+        fromDatabase:
+          name: tracevault-db
+          property: connectionString
+      - key: LOG_LEVEL
+        value: INFO
+
+  # --- 2. Web Service (Handles API and hosts the Next.js Frontend) ---
+  - type: web
+    name: tracevault-web
+    env: docker # Use Docker to combine Python API and Next.js frontend hosting
+    region: oregon
+    
+    # Render will look for a Dockerfile in the root, which we will define next.
+    # This service needs to handle port 5000 (Flask API) and port 3000 (Next.js).
+    # The Dockerfile handles this using Nginx or by integrating the Flask API.
+    
+    plan: standard
+    
+    envVars:
+      # Flask/API Environment Variables
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: SECRET_KEY
+        generateValue: true
+      - key: UPLOAD_FOLDER
+        value: /app/uploads
+      - key: REDIS_URL # Required for API to enqueue jobs
+        sync: false
+      - key: DATABASE_URL 
+        fromDatabase:
+          name: tracevault-db
+          property: connectionString
+      
+      # Next.js Frontend Environment Variable (passed as runtime env)
+      - key: NEXT_PUBLIC_API_URL
+        value: "http://localhost:5000/api" # Use localhost for internal Docker communication
+
+      # Port configuration
+      - key: PORT
+        value: 10000 # Render's required binding port
+
