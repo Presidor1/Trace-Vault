@@ -1,51 +1,85 @@
-# tracevault/backend/api/app.py
+# tracevault/backend/api/app.py (OVERWRITE)
 
 import os
 import uuid
-import json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from dotenv import load_dotenv
+
+# --- Project Imports ---
+from logs.logger import get_logger
+from database.models import init_db, Evidence, AnalysisStatus, MediaType
+from workers.orchestrator_worker import orchestrate_analysis
 
 # Task Queue setup
 import redis
 from rq import Queue
+from sqlalchemy.orm import Session
 
-# --- Project Imports ---
-# NOTE: We need to import the function we want to enqueue
-# The 'workers' directory must be visible to the Flask app
-from workers.metadata_worker import process_media
+# --- Setup ---
+logger = get_logger(__name__)
 
-# --- Load Environment Variables ---
-# Assumes the .env file is one directory up (in backend/config)
+# Load Environment Variables
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', 'config', '.env'))
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
-
-# Security: Allow frontend (React on Render) to talk to the backend
 CORS(app) 
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER') or '/tmp/uploads'
-
-# Ensure the upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# --- Redis & Task Queue Setup ---
+# --- Global Connections ---
+REDIS_URL = os.getenv('REDIS_URL')
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+# Initialize DB and Redis/RQ outside of the main request loop
+if not DATABASE_URL or not REDIS_URL:
+    logger.critical("Missing DATABASE_URL or REDIS_URL in environment. Cannot start.")
+    sys.exit(1)
+
 try:
-    # Connect to the Redis instance using the URL from .env
-    redis_conn = redis.from_url(os.getenv('REDIS_URL'))
-    
-    # Create the RQ Queue instance. 'default' is the standard queue name.
-    task_queue = Queue('default', connection=redis_conn)
-    
-    print("✅ Successfully connected to Redis/Upstash Task Queue.")
-    
+    SessionLocal, engine = init_db(DATABASE_URL)
+    logger.info("✅ Database connected and models initialized.")
 except Exception as e:
-    print(f"❌ Failed to connect to Redis: {e}")
-    # In a production app, you would log this and perhaps halt the app.
+    logger.critical(f"❌ Failed to connect to Database: {e}")
+    SessionLocal = None
+    engine = None
+
+try:
+    redis_conn = redis.from_url(REDIS_URL)
+    task_queue = Queue('default', connection=redis_conn)
+    logger.info("✅ Redis Task Queue connected.")
+except Exception as e:
+    logger.critical(f"❌ Failed to connect to Redis: {e}")
     task_queue = None
     redis_conn = None
+
+
+# --- Per-Request Database Session Management ---
+@app.before_request
+def before_request():
+    """Opens a new database session before each request."""
+    g.db = SessionLocal()
+
+@app.teardown_request
+def teardown_request(exception=None):
+    """Closes the database session after each request."""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+
+# --- Utility: Determine Media Type ---
+def get_media_type(filename: str) -> MediaType:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
+        return MediaType.IMAGE
+    elif ext in ['.mp4', '.mov', '.avi', '.wmv']:
+        return MediaType.VIDEO
+    elif ext in ['.pdf', '.doc', '.docx']:
+        return MediaType.DOCUMENT
+    return MediaType.OTHER
 
 
 # --- API Routes ---
@@ -53,89 +87,114 @@ except Exception as e:
 @app.route('/api/upload', methods=['POST'])
 def upload_evidence():
     """
-    Handles file upload, saves the file, and dispatches a job to the queue.
+    Handles file upload, saves record to DB, and dispatches job to orchestrator.
     """
+    if not g.db or not task_queue:
+        return jsonify({"status": "error", "message": "Backend services unavailable."}), 503
+
     if 'file' not in request.files:
         return jsonify({"status": "error", "message": "No file part in the request"}), 400
 
     uploaded_file = request.files['file']
-
     if uploaded_file.filename == '':
         return jsonify({"status": "error", "message": "No file selected for uploading"}), 400
 
     if uploaded_file:
-        # Create a unique, secure filename to prevent collisions and path traversal
         file_ext = os.path.splitext(uploaded_file.filename)[1]
         unique_filename = str(uuid.uuid4()) + file_ext
         save_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        media_type = get_media_type(uploaded_file.filename)
         
         try:
-            # 1. Save the file locally (This will be replaced by direct S3 upload later)
+            # 1. Save the file locally to the temporary path
             uploaded_file.save(save_path)
             
-            # 2. Dispatch the job to the Redis Queue
-            if task_queue:
-                # The 'process_media' function from metadata_worker.py is added to the queue
-                job = task_queue.enqueue(
-                    f=process_media, 
-                    args=(save_path,),             # Arguments passed to the function
-                    job_timeout='1h',              # Set a generous timeout for processing
-                    result_ttl=86400               # Store the job result for 24 hours
-                )
+            # 2. Create the initial Evidence record in the database
+            new_evidence = Evidence(
+                original_filename=uploaded_file.filename,
+                storage_path=save_path, # In a real app, this is the S3 URL
+                media_type=media_type,
+                status=AnalysisStatus.PENDING
+            )
+            g.db.add(new_evidence)
+            g.db.commit()
+            evidence_id = new_evidence.id
+            
+            logger.info(f"Evidence {evidence_id} uploaded and saved to {save_path}.")
 
-                # 3. Return the Job ID to the frontend for status polling
-                return jsonify({
-                    "status": "processing", 
-                    "message": "File uploaded and analysis job dispatched.",
-                    "job_id": job.id,
-                    "filename": unique_filename
-                }), 202 # 202 Accepted, job is pending
+            # 3. Dispatch the job to the Orchestrator Worker
+            job = task_queue.enqueue(
+                f=orchestrate_analysis, 
+                args=(evidence_id, save_path, media_type),
+                job_timeout='2h', 
+                result_ttl=86400
+            )
 
-            else:
-                return jsonify({"status": "error", "message": "Task queue service is unavailable."}), 503
+            # 4. Return the Job ID and Evidence ID to the frontend
+            return jsonify({
+                "status": "queued", 
+                "message": "File uploaded and analysis job dispatched.",
+                "evidence_id": evidence_id,
+                "job_id": job.id
+            }), 202 
 
         except Exception as e:
-            app.logger.error(f"Error during file processing: {e}")
+            logger.error(f"Error during file upload/dispatch: {e}", exc_info=True)
             return jsonify({"status": "error", "message": f"Server processing error: {e}"}), 500
 
 
-@app.route('/api/status/<job_id>', methods=['GET'])
-def get_job_status(job_id):
+@app.route('/api/status/<evidence_id>', methods=['GET'])
+def get_evidence_status(evidence_id):
     """
-    Allows the frontend to poll for the status of a specific job.
+    Allows the frontend to check the status of the evidence and retrieve results.
     """
-    if not task_queue:
-        return jsonify({"status": "error", "message": "Task queue service is unavailable."}), 503
+    if not g.db:
+        return jsonify({"status": "error", "message": "Database service unavailable."}), 503
 
     try:
-        job = task_queue.fetch_job(job_id)
+        # We don't need the RQ Job ID anymore, we track status via the DB record!
+        evidence = g.db.query(Evidence).filter(Evidence.id == evidence_id).first()
 
-        if job is None:
-            return jsonify({"status": "error", "message": "Job not found."}), 404
+        if evidence is None:
+            return jsonify({"status": "error", "message": "Evidence ID not found."}), 404
 
-        status = job.get_status()
-        
-        if status == 'finished':
-            # The job is complete, return the result (which is a JSON string)
-            return jsonify({
-                "status": "complete",
-                "result": json.loads(job.result), # Convert the JSON string from the worker back to a Python object
-                "message": "Analysis complete."
-            }), 200
-        
-        else:
-            # Job is queued, started, deferred, etc.
-            return jsonify({
-                "status": status,
-                "message": f"Job is currently {status}.",
-            }), 202
+        status = evidence.status.value
+        response_data = {
+            "status": status,
+            "message": f"Evidence analysis status: {status}",
+            "evidence_id": evidence.id,
+            "media_type": evidence.media_type.value,
+        }
+
+        # If analysis is complete or failed, return the full report (simplified view)
+        if status in [AnalysisStatus.ANALYSIS_COMPLETE.value, AnalysisStatus.FAILED.value]:
+            
+            if status == AnalysisStatus.ANALYSIS_COMPLETE.value:
+                # Retrieve the basic report
+                metadata = g.db.query(MetadataReport).filter(MetadataReport.evidence_id == evidence_id).first()
+                frames = g.db.query(Frame).filter(Frame.evidence_id == evidence_id).all()
+                
+                report = {
+                    "metadata": metadata.extracted_metadata if metadata else None,
+                    "ocr_text": metadata.ocr_text if metadata else None,
+                    "frames_analyzed": len(frames)
+                    # For a real API, you would retrieve all linked Faces and Scenes here
+                }
+                response_data['report'] = report
+            
+            elif status == AnalysisStatus.FAILED.value:
+                 response_data['message'] = "Analysis failed. Check backend logs for details."
+
+
+        return jsonify(response_data), 200
 
     except Exception as e:
-        return jsonify({"status": "error", "message": f"Could not retrieve job status: {e}"}), 500
+        logger.error(f"Could not retrieve status for {evidence_id}: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": f"Server error retrieving status: {e}"}), 500
 
 
 # --- Server Start ---
 if __name__ == '__main__':
     # When deployed on Render, the host will likely be 0.0.0.0
     app.run(debug=True, host='0.0.0.0', port=5000)
-
+        
